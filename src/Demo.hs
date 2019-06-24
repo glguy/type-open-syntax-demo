@@ -12,9 +12,9 @@ import Data.Parameterized.TraversableFC (FunctorFC(..), FoldableFC(..), Traversa
                                          fmapFCDefault, foldMapFCDefault)
 import Data.Parameterized.TH.GADT       (structuralTypeEquality, structuralTraversal)
 import Data.Parameterized.Classes       (TestEquality(..), (:~:)(Refl))
-import Data.Parameterized.Ctx.Proofs    (assoc)
 import Data.Parameterized.Some
-import Data.Proxy                       (Proxy(Proxy))
+import Control.Category                 ((.))
+import Prelude                          hiding ((.))
 
 ------------------------------------------------------------------------
 -- Universe of types in our language -----------------------------------
@@ -209,10 +209,10 @@ compileK s1 d1 e k =
       (forall e. e t1 -> e t2 -> ExprF e t) ->
       (Expr src t1 -> Expr src t2 -> SSA tgt u)
     binOp op x y =
-      compileK s1 d1          x \d2 x' -> let s2 = extSize s1 d2 in
-      compileK s2 (d1 <+> d2) y \d3 y' -> let s3 = extSize s2 d3 in
+      compileK s1 d1        x \d2 x' -> let s2 = extSize s1 d2 in
+      compileK s2 (d2 . d1) y \d3 y' -> let s3 = extSize s2 d3 in
       op (weakenSimple d3 x') y' :>>
-      k (extendRight (d2 <+> d3))
+      k (extendRight (d3 . d2))
         (SimpleVar (lastVar s3))
 
 evalSSA :: Assignment Value' env -> SSA env t -> Value t
@@ -268,15 +268,3 @@ typeCheck checkVar (UExprF ef) =
     helper = viewSome (cast knownRep) <=< typeCheck checkVar . getConst
 
     done = Just . Some . ExprF
-
-------------------------------------------------------------------------
--- Missing parameterized-utils functionality ---------------------------
-------------------------------------------------------------------------
-
-(<+>) :: forall a b c. Diff a b -> Diff b c -> Diff a c
-(<+>) ab bc
-  | IsAppend x <- diffIsAppend ab
-  , IsAppend y <- diffIsAppend bc
-  , Refl       <- assoc (Proxy :: Proxy a) x y
-  = appendDiff (addSize x y)
-{-# INLINE (<+>) #-}

@@ -16,7 +16,7 @@ maintainer:          emertens@gmail.com
 extra-source-files:  CHANGELOG.md
 
 library
-  exposed-modules: Demo, TH
+  exposed-modules: Demo
   -- other-modules:
   -- other-extensions:
   build-depends:       base ^>=4.12.0.0, parameterized-utils, template-haskell
