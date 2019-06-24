@@ -7,15 +7,15 @@ module Demo where
 import Data.Kind                        (Type)
 import Data.Parameterized.Context       (Assignment, Ctx, EmptyCtx, (::>),
                                          Index, Diff, Size, extendIndex',
-                                         nextIndex, (!), noDiff, extSize,
-                                         extendRight, extend, size)
+                                         nextIndex, (!), noDiff, extend, size,
+                                         KnownDiff(knownDiff), extSize)
 import Data.Parameterized.TraversableFC (FunctorFC(..), FoldableFC(..), TraversableFC(..),
                                          fmapFCDefault, foldMapFCDefault)
 import Data.Parameterized.TH.GADT       (structuralTypeEquality, structuralTraversal)
 import Data.Parameterized.Classes       (ShowF(showsPrecF), TestEquality(..), (:~:)(Refl))
-import Data.Parameterized.Some          (Some(Some), mapSome, viewSome)
-import Control.Category                 ((.))
-import Prelude                          hiding ((.))
+-- import Data.Parameterized.Some          (Some(Some), mapSome, viewSome)
+import Control.Category
+import Prelude                          hiding ((.), id)
 
 ------------------------------------------------------------------------
 -- Universe of types in our language -----------------------------------
@@ -78,11 +78,13 @@ cast rep x =
 -- 1. The type of subexpression values
 -- 2. The logical type of the expression in the language being modeled
 data ExprF :: (U -> Type) -> (U -> Type) where
+  Ifte    :: URep r -> e BoolT -> e r -> e r -> ExprF e r -- ^ if-then-else
+  Add     :: e IntT  -> e IntT  -> ExprF e IntT  -- ^ arithetic adition
+  Negate  :: e IntT  ->            ExprF e IntT  -- ^ negate integer
+  NonZero :: e IntT  ->            ExprF e BoolT -- ^ non-zero test
+  Not     :: e BoolT ->            ExprF e BoolT -- ^ boolean not
   Bool    :: Bool    ->            ExprF e BoolT -- ^ constant boolean
   Int     :: Int     ->            ExprF e IntT  -- ^ constant integer
-  Add     :: e IntT  -> e IntT  -> ExprF e IntT  -- ^ arithetic adition
-  NonZero :: e IntT  ->            ExprF e BoolT -- ^ non-zero test
-  Ifte    :: URep r -> e BoolT -> e r -> e r -> ExprF e r -- ^ if-then-else
 
 return [] -- allow structuralTraversal to see ExprF
 
@@ -93,10 +95,12 @@ instance TraversableFC ExprF where
 
 -- | Compute the logical type of an expression formed by an 'ExprF'
 instance HasType (ExprF e) where
+  hasType Add    {} = knownRep
   hasType Bool   {} = knownRep
   hasType Int    {} = knownRep
-  hasType Add    {} = knownRep
+  hasType Negate {} = knownRep
   hasType NonZero{} = knownRep
+  hasType Not    {} = knownRep
   hasType (Ifte rep _ _ _) = rep
 
 evalExprF :: ExprF Value' t -> Value' t
@@ -106,13 +110,15 @@ evalExprF e =
     Int i                       -> Value i
     Add (Value x) (Value y)     -> Value (x + y)
     NonZero (Value x)           -> Value (x /= 0)
-    Ifte _ (Value True ) x _    -> x
-    Ifte _ (Value False) _ x    -> x
+    Not (Value x)               -> Value (not x)
+    Negate (Value x)            -> Value (negate x)
+    Ifte _ (Value c) x y        -> if c then x else y
 
 ------------------------------------------------------------------------
 -- Type-annotated variables --------------------------------------------
 ------------------------------------------------------------------------
 
+-- | Type-annotated variables
 data Variable :: Ctx U -> U -> Type where
   Variable :: URep t -> Index env t -> Variable env t
 
@@ -125,11 +131,8 @@ weakenVariable d (Variable t i) = Variable t (extendIndex' d i)
 evalVariable :: Assignment Value' env -> Variable env t -> Value t
 evalVariable env (Variable _ i) = getValue (env ! i)
 
-lastVar :: KnownRep t => Size env -> Variable (env ::> t) t
-lastVar = lastVar' knownRep
-
-lastVar' :: URep t -> Size env -> Variable (env ::> t) t
-lastVar' rep s = Variable rep (nextIndex s)
+lastVar :: URep t -> Size env -> Variable (env ::> t) t
+lastVar rep s = Variable rep (nextIndex s)
 
 ------------------------------------------------------------------------
 -- Recursively defined expression trees with variables -----------------
@@ -185,49 +188,73 @@ data SSA :: Ctx U -> U -> Type where
 infixr 5 :>>
 
 compile :: Size env -> Expr env t -> SSA env t
-compile s e = compileK s noDiff e \_ -> Return
+compile s e = compileK (D noDiff s) e \_ -> Return
 
-type M src dst t u = Size dst -> Diff src dst -> t -> SSA dst u
+data D src tgt = D
+  { dDiff :: !(Diff src tgt)
+  , dSize :: !(Size tgt)
+  }
+
+extD :: KnownDiff b c => D a b -> D a c
+extD (D d s) = D (knownDiff . d) (extSize s knownDiff)
+
+truncD :: D src tgt -> D tgt tgt
+truncD d = D noDiff (dSize d)
+
+(<+>) :: D a b -> D b c -> D a c
+(<+>) ab bc = D (dDiff bc . dDiff ab) (dSize bc)
 
 compileK ::
   forall src tgt t u.
-  Size tgt ->
-  Diff src tgt ->
+  D src tgt ->
   Expr src t ->
-  (forall env. Diff tgt env -> Simple env t -> SSA env u) ->
+  (forall env. D tgt env -> Simple env t -> SSA env u) ->
   SSA tgt u
-compileK s1 d1 e k =
+compileK d e k =
   case e of
-    ExprVar v -> k noDiff (SimpleVar (weakenVariable d1 v))
-    ExprF ef ->
-      case ef of
-        Bool b -> k noDiff (SimpleBool b)
-        Int  i -> k noDiff (SimpleInt  i)
+    ExprVar v -> k (truncD d) (SimpleVar (weakenVariable (dDiff d) v))
+    ExprF ef -> compileExprFK d ef k
 
-        NonZero x ->
-          compileK s1 d1 x \d2 x' -> let s2 = extSize s1 d2 in
+compileExprFK ::
+  forall src tgt t u.
+  D src tgt ->
+  ExprF (Expr src) t ->
+  (forall env. D tgt env -> Simple env t -> SSA env u) ->
+  SSA tgt u
+compileExprFK d1 ef k =
+  case ef of
+    Bool b -> k (truncD d1) (SimpleBool b)
+    Int  i -> k (truncD d1) (SimpleInt  i)
 
-          NonZero x' :>>
-          k (extendRight d2) (SimpleVar (lastVar s2))
+    NonZero x -> unary NonZero x
+    Not     x -> unary Not     x
+    Negate  x -> unary Negate  x
 
-        Add x y ->
-          compileK s1 (     d1) x \d2 x' -> let s2 = extSize s1 d2 in
-          compileK s2 (d2 . d1) y \d3 y' -> let s3 = extSize s2 d3 in
+    Add x y ->
+      compileK d1          x \d2 x' ->
+      compileK (d1 <+> d2) y \d3 y' ->
 
-          Add (weakenSimple d3 x') y' :>>
-          k (extendRight (d3 . d2))
-            (SimpleVar (lastVar s3))
+      Add (weakenSimple (dDiff d3) x') y' :>>
+      k (extD (d2 <+> d3)) (answerVar knownRep d3)
 
-        Ifte rep x y z ->
-          compileK s1 (          d1) x \d2 x' -> let s2 = extSize s1 d2 in
-          compileK s2 (     d2 . d1) y \d3 y' -> let s3 = extSize s2 d3 in
-          compileK s3 (d3 . d2 . d1) z \d4 z' -> let s4 = extSize s3 d4 in
+    Ifte rep x y z ->
+      compileK d1                 x \d2 x' ->
+      compileK (d1 <+> d2       ) y \d3 y' ->
+      compileK (d1 <+> d2 <+> d3) z \d4 z' ->
 
-          Ifte rep (weakenSimple (d4 . d3) x')
-                   (weakenSimple (d4     ) y')
-                   (                       z') :>>
-          k (extendRight (d4 . d3 . d2))
-            (SimpleVar (Variable rep (nextIndex s4)))
+      Ifte rep (weakenSimple (dDiff (d3 <+> d4)) x')
+               (weakenSimple (dDiff (d4       )) y')
+               (                                 z') :>>
+      k (extD (d2 <+> d3 <+> d4)) (answerVar rep d4)
+  where
+    answerVar rep d = SimpleVar (lastVar rep (dSize d))
+
+    unary ::
+      KnownRep t =>
+      (forall e. e a -> ExprF e t) ->
+      Expr src a -> SSA tgt u
+    unary op x =
+      compileK d1 x \d2 x' -> op x' :>> k (extD d2) (answerVar knownRep d2)
 
 
 evalSSA :: Assignment Value' env -> SSA env t -> Value t
@@ -266,6 +293,8 @@ compileTest env e = evalExpr env e
 -- Untyped syntax ------------------------------------------------------
 ------------------------------------------------------------------------
 
+{- Doesn't really work since adding polymorphic Ifte primitive
+
 -- | Untyped expressions
 data UExpr :: Type where
   UVar   :: String -> UExpr
@@ -284,6 +313,7 @@ typeCheck checkVar (UExprF ef) = Some . ExprF <$> traverseFC checkArg ef
     checkArg :: UArg t -> Maybe (Expr env t)
     checkArg (UArg e) = viewSome (cast knownRep) =<< typeCheck checkVar e
 
+-}
 
 ------------------------------------------------------------------------
 -- Show instances ------------------------------------------------------
@@ -295,25 +325,27 @@ instance ShowF e => Show (ExprF e t) where
   showsPrec p e =
     showParen (p >= 11)
     case e of
-      Bool    b   -> showString "Bool "    . showsPrec  11 b
-      Int     i   -> showString "Int "     . showsPrec  11 i
-      NonZero x   -> showString "NonZero " . showsPrecF 11 x
-      Add     x y -> showString "Add "     . showsPrecF 11 x
-                            . showChar ' ' . showsPrecF 11 y
-      Ifte rep x y z -> showString "Ifte " . showsPrec  11 rep
-                            . showChar ' ' . showsPrecF 11 x
-                            . showChar ' ' . showsPrecF 11 y
-                            . showChar ' ' . showsPrecF 11 z
+      Negate  x     -> showString "Negate"  . argF x
+      Not     x     -> showString "Not"     . argF x
+      Bool    x     -> showString "Bool"    . arg  x
+      Int     x     -> showString "Int"     . arg  x
+      NonZero x     -> showString "NonZero" . argF x
+      Add     x y   -> showString "Add"     . argF x . argF y
+      Ifte r  x y z -> showString "Ifte"    . arg  r . argF x . argF y . argF z
+    where
+      arg  x = showChar ' ' . showsPrec  11 x
+      argF x = showChar ' ' . showsPrecF 11 x
 
 deriving instance Show (Variable env t)
-deriving instance Show (UArg t)
-deriving instance Show UExpr
 deriving instance Show (Expr env t)
 deriving instance Show (Simple env t)
 deriving instance Show (SSA env t)
 
-instance ShowF UArg
 instance ShowF e => ShowF (ExprF e)
 instance ShowF (Variable env)
 instance ShowF (Expr env)
 instance ShowF (Simple env)
+
+-- deriving instance Show (UArg t)
+-- deriving instance Show UExpr
+-- instance ShowF UArg
