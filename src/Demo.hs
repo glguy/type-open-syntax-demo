@@ -4,9 +4,7 @@
 {-# OPTIONS_GHC -Wall #-}
 module Demo where
 
-import Control.Monad                    ((<=<))
 import Data.Kind                        (Type)
-import Data.Functor.Const               (Const(..))
 import Data.Parameterized.Context
 import Data.Parameterized.TraversableFC (FunctorFC(..), FoldableFC(..), TraversableFC(..),
                                          fmapFCDefault, foldMapFCDefault)
@@ -248,7 +246,9 @@ compileTest env e =
 -- | Untyped expressions
 data UExpr :: Type where
   UVar   :: String -> UExpr
-  UExprF :: ExprF (Const UExpr) t -> UExpr
+  UExprF :: ExprF UArg t -> UExpr
+
+data UArg t = KnownRep t => UArg UExpr
 
 typeCheck ::
   forall env.
@@ -256,15 +256,7 @@ typeCheck ::
   UExpr ->
   Maybe (Some (Expr env))
 typeCheck checkVar (UVar name) = mapSome ExprVar <$> checkVar name
-typeCheck checkVar (UExprF ef) =
-  case ef of
-    Int i     -> done (Int i)
-    Bool i    -> done (Bool i)
-    NonZero x -> done =<< NonZero <$> helper x
-    And x y   -> done =<< And <$> helper x <*> helper y
-    Add x y   -> done =<< Add <$> helper x <*> helper y
+typeCheck checkVar (UExprF ef) = Some . ExprF <$> traverseFC checkArg ef
   where
-    helper :: forall (z :: U) t. KnownRep t => Const UExpr z -> Maybe (Expr env t)
-    helper = viewSome (cast knownRep) <=< typeCheck checkVar . getConst
-
-    done = Just . Some . ExprF
+    checkArg :: UArg t -> Maybe (Expr env t)
+    checkArg (UArg e) = viewSome (cast knownRep) =<< typeCheck checkVar e
